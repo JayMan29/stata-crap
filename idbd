@@ -1,0 +1,278 @@
+capture log close
+log using "C:\Users\jayma\Downloads\NSTEMI.smcl", replace
+
+
+************************************************************
+* NIS SURVEY SETUP
+************************************************************
+
+svyset [pweight = DISCWT], strata (NIS_STRATUM) psu (HOSP_NIS) singleunit(centered)
+
+************************************************************
+*RESTRICT TO ADULTS
+************************************************************
+
+keep if AGE >= 18
+
+
+************************************************************
+*IDENTIFY MI Codes (primary only)
+************************************************************
+**MI Codes**
+*STEMI: I21.0–I21.3, I22.0, I22.1, I22.8, I22.9
+*NSTEMI: I21.4, I22.2
+gen Disease = 0
+replace Disease = 1 if ///
+    substr(I10_DX1,1,4)=="I210" | ///
+    substr(I10_DX1,1,4)=="I211" | ///
+    substr(I10_DX1,1,4)=="I212" | ///
+    substr(I10_DX1,1,4)=="I213" | ///
+    substr(I10_DX1,1,4)=="I214" 
+
+keep if Disease==1
+
+*adult Generic Disease DX1 to DX40
+generate adultDisease=0
+replace adultDisease=1 if Disease==1 & AGE>=18
+svy, subpop (adult): total adultDisease, cformat(%9.0fc)
+svy, subpop (adult): proportion adultDisease
+
+*COMORBIDITY= NSTEMI
+*NSTEMI: I21.4, I22.2
+gen comborbiditydx1to40 = 0
+replace comborbiditydx1to40 = 1 if ///
+    substr(I10_DX1,1,4)=="I214" 
+
+svy: total comborbiditydx1to40, cformat(%9.0fc)
+svy: proportion comborbiditydx1to40
+
+*Adult Generic Comorbidity
+generate adultcomborbiditydx1to40=0
+replace adultcomborbiditydx1to40=1 if comborbiditydx1to40==1 
+svy: total adultcomborbiditydx1to40, cformat(%9.0fc)
+
+*TWO GROUPS: Generic Adult Disease with and without a specific comoribidty
+
+*Generic disease as DX1-40 diagnoses plus specific comborbidity
+generate adultDiseasewComorbidity=0
+replace adultDiseasewComorbidity=1 if adultDisease==1 & adultcomborbiditydx1to40==1
+svy: total adultDiseasewComorbidity
+svy, subpop (adultDisease): total adultcomborbiditydx1to40, cformat(%9.0fc)
+svy, subpop (adultDisease): proportion adultcomborbiditydx1to40
+
+*Generic Disease as DX1-40 diagnoses without specific comorbidity
+**Without Comorbidity=STEMI
+generate adultDiseasewoComorbidity=0
+replace adultDiseasewoComorbidity=1 if adultDisease==1 & adultcomborbiditydx1to40 !=1
+svy: total adultDiseasewoComorbidity
+svy, subpop (adultDisease): total adultDiseasewoComorbidity, cformat(%9.0fc)
+svy, subpop (adultDisease): proportion adultDiseasewoComorbidity
+
+**Table 1
+**Demographics
+*gender (female)
+svy, subpop (adultDisease): total FEMALE
+svy, subpop (adultDisease): proportion FEMALE
+svy, subpop (adultDiseasewComorbidity): total FEMALE, cformat(%9.1fc) 
+svy, subpop (adultDiseasewComorbidity): proportion FEMALE
+svy, subpop (adultDiseasewoComorbidity): total FEMALE, cformat(%9.0fc)
+svy, subpop (adultDiseasewoComorbidity): proportion FEMALE
+*p-Value income by regression
+svy, subpop (adultDisease): logistic adultcomborbiditydx1to40 i.FEMALE 
+*P-value by chi square
+svy, subpop (adultDisease): tabulate adultcomborbiditydx1to40 FEMALE 
+*p-value for female using  Chi Square
+*Chi-Square Distribution: When we consider, the null speculation is true, the sampling distribution of the test statistic is called as chi-squared distribution. The chi-squared test helps to determine whether there is a notable difference between the normal frequencies and the observed frequencies in one or more classes or categories. Note: Chi-squared test is applicable only for categorical data, such as men and women falling under the categories of Gender, Age, Height, etc.
+*Finding P-Value. P stands for probability here. To calculate the p-value, the chi-square test is used in statistics. The different values of p indicates the different hypothesis interpretation, are given below:
+*P≤ 0.05; Hypothesis rejected
+*P>.05; Hypothesis Accepted
+
+*Male
+generate Male=0
+replace Male=1 if FEMALE==0
+svy, subpop (adultDisease): total Male
+svy, subpop (adultDisease): proportion Male
+svy, subpop (adultDiseasewComorbidity): total Male, cformat(%9.1fc) 
+svy, subpop (adultDiseasewComorbidity): proportion Male
+svy, subpop (adultDiseasewoComorbidity): total Male, cformat(%9.0fc)
+svy, subpop (adultDiseasewoComorbidity): proportion Male
+*p-value income by regression
+svy, subpop (adultDisease): logistic adultcomborbiditydx1to40 i.Male
+*P-value by chi square
+svy, subpop (adultDisease): tabulate adultcomborbiditydx1to40 Male
+
+*gender data missing
+generate MissingGender=0
+replace MissingGender=1 if FEMALE==. & adult==1
+svy, subpop (adultDisease): total
+svy, subpop (adultDisease): proportion
+svy, subpop (adultDiseasewComorbidity): total MissingGender, cformat(%9.1fc) 
+svy, subpop (adultDiseasewComorbidity): proportion MissingGender
+svy, subpop (adultDiseasewoComorbidity): total MissingGender, cformat(%9.0fc)
+svy, subpop (adultDiseasewoComorbidity): proportion MissingGender
+*p-value income by regression
+svy, subpop (adultDisease): logistic adultcomborbiditydx1to40 i.MissingGender
+*P-value by chi square
+svy, subpop (adultDisease): tabulate adultcomborbiditydx1to40 MissingGender
+
+*AGE basic stats
+svy, subpop (adultDisease): mean AGE
+estat sd
+svy, subpop (adultDiseasewComorbidity): mean AGE
+estat sd
+svy, subpop (adultDiseasewoComorbidity): mean AGE
+estat sd
+*p-value for age by regression
+svy, subpop (adultDisease): regress AGE i.adultcomborbiditydx1to40
+svy, subpop (adultDisease): regress AGE adultcomborbiditydx1to40
+svy, subpop (adultDisease): logistic adultcomborbiditydx1to40 AGE 
+
+*Hypothesis Testing: Concept of p-value
+*In statistics, The question of interest is: Is the difference between the two groups equal to zero? The answer to this question is hypothesis testing.
+
+*Definitions:
+*Null hypothesis: H0: There is no difference between the two values we are comparing. Any numerical difference we see is due to chance alone and is therefore not true
+
+*Alternative hypothesis: H1: There is a real difference between the two values we are comparing. The numerical difference we see is not due to chance alone and is therefore true
+
+*Hypothesis testing: The process of deciding which one of the two hypothesis above is true. 
+
+*AGE descriptive statistics to get IQR (25% and 75%); median and IQR are the preferred measurement of the middle if the continuous variable is not normally distributed
+*Stata offers 4 weighting options: frequency weights (fweight), analytic weights (aweight), probability weights (pweight) and importance weights (iweight). 
+*the weight command family requires square brackets [weight] to work
+*Age of adultDisease
+summarize AGE [aweight=DISCWT] if adultDisease==1 & adult==1, detail
+*Age of Diseased group with comborbidity
+summarize AGE [aweight=DISCWT] if adultDiseasewComorbidity==1 & adult==1, detail
+*Age of Diseased group without comborbidity
+summarize AGE [aweight=DISCWT] if adultDiseasewoComorbidity==1 & adult==1, detail
+
+*Parametric= normally distributed
+*Non-parametric= nonnormally distributed (not a bell curve)
+
+*Skewness refers to a distortion or asymmetry that deviates from the symmetrical bell curve, or normal distribution, in a set of data. If the curve is shifted to the left or to the right, it is said to be skewed. The skewness value can be positive, zero, negative, or undefined. 
+*The rule of thumb seems to be: If the skewness is between -0.5 and 0.5, the data are fairly symmetrical. If the skewness is between -1 and – 0.5 or between 0.5 and 1, the data are moderately skewed. If the skewness is less than -1 or greater than 1, the data are highly skewed.
+
+*Kurtosis is a measure of whether the data are heavy-tailed or light-tailed relative to a normal distribution. That is, data sets with high kurtosis tend to have heavy tails, or outliers.
+*An excess kurtosis above 0 indicates the tails are heavier than the normal distribution. An excess kurtosis below 0 indicates the tails are lighter than the normal distribution. An excess kurtosis value of 1 and above or -1 and below represents a sizable departure from normality.
+
+*Comparing medians for age (to see if medians are statisically different)
+*Wilcoxon rank-sum test: Test for equality of distributions of v over two groups defined by the levels of catvar1
+*ranksum v, by(catvar1)"
+ranksum AGE if adultDisease==1, by(adultcomborbiditydx1to40)
+*Nonparametric equality-of-medians test
+*Equality of medians test for v over two or more groups defined by the levels of catvar2 "median v, by(catvar2)"
+median AGE if adultDisease==1, by(adultcomborbiditydx1to40)
+*"ranksum"and "median" are for use with unmatched data. For equality tests on matched data, see *Wilcoxon Wilcoxon matched-pairs signed-ranks test
+STOP
+
+************************************************
+*AGE Groups
+************************************************
+gen agegrp = .
+replace agegrp = 1 if AGE>=18 & AGE<=29
+replace agegrp = 2 if AGE>=30 & AGE<=39
+replace agegrp = 3 if AGE>=40 & AGE<=49
+replace agegrp = 4 if AGE>=50 & AGE<=59
+replace agegrp = 5 if AGE>=60 & AGE<=69
+replace agegrp = 6 if AGE>=70
+
+label define agegrp 1 "18-29" 2 "30-39" 3 "40-49" 4 "50-59" 5 "60-69" 6 "70+"
+label values agegrp agegrp
+
+gen age1 = agegrp==1
+gen age2 = agegrp==2
+gen age3 = agegrp==3
+gen age4 = agegrp==4
+gen age5 = agegrp==5
+gen age6 = agegrp==6
+
+************************************************
+* NSTEMI (adultDiseasewComorbidity) by age
+************************************************
+gen nstemi_age1 = age1==1 & adultDiseasewComorbidity==1
+gen nstemi_age2 = age2==1 & adultDiseasewComorbidity==1
+gen nstemi_age3 = age3==1 & adultDiseasewComorbidity==1
+gen nstemi_age4 = age4==1 & adultDiseasewComorbidity==1
+gen nstemi_age5 = age5==1 & adultDiseasewComorbidity==1
+gen nstemi_age6 = age6==1 & adultDiseasewComorbidity==1
+
+************************************************
+* STEMI (adultDiseasewoComorbidity) by age
+************************************************
+gen stemi_age1 = age1==1 & adultDiseasewoComorbidity==1
+gen stemi_age2 = age2==1 & adultDiseasewoComorbidity==1
+gen stemi_age3 = age3==1 & adultDiseasewoComorbidity==1
+gen stemi_age4 = age4==1 & adultDiseasewoComorbidity==1
+gen stemi_age5 = age5==1 & adultDiseasewoComorbidity==1
+gen stemi_age6 = age6==1 & adultDiseasewoComorbidity==1
+
+************************************************
+* Totals by MI Type by Age Group
+************************************************
+svy: total nstemi_age1 nstemi_age2 nstemi_age3 nstemi_age4 nstemi_age5 nstemi_age6
+svy: total stemi_age1  stemi_age2  stemi_age3  stemi_age4  stemi_age5  stemi_age6
+svy: total age1 age2 age3 age4 age5 age6
+
+************************************************
+* Trends by MI Type by Age Group
+************************************************
+svy: total nstemi_age1 nstemi_age2 nstemi_age3 nstemi_age4 nstemi_age5 nstemi_age6, over(YEAR)
+svy: total stemi_age1 stemi_age2 stemi_age3 stemi_age4 stemi_age5 stemi_age6, over(YEAR)
+svy: total age1 age2 age3 age4 age5 age6, over(YEAR)
+
+svy: proportion adultDiseasewComorbidity, over(agegrp YEAR)
+svy: proportion adultDiseasewoComorbidity, over(agegrp YEAR)
+
+*********************************************************
+*Logistic Regression for MI type trends (Unadjusted)
+*********************************************************
+foreach g in 1 2 3 4 5 6 {
+
+    di "Trend NSTEMI proportion age group `g'"
+
+    svy, subpop(age`g'): logistic adultDiseasewComorbidity c.YEAR
+
+}
+
+
+foreach g in 1 2 3 4 5 6 {
+
+    di "Trend STEMI proportion age group `g'"
+
+    svy, subpop(age`g'): logistic adultDiseasewoComorbidity c.YEAR
+
+}
+
+svy: logistic adultDiseasewComorbidity c.YEAR##i.agegrp
+svy: logistic adultDiseasewoComorbidity c.YEAR##i.agegrp
+
+*********************************************************
+*Logistic Regression for MI type trends (Sex adjusted)
+*********************************************************
+foreach g in 1 2 3 4 5 6 {
+
+    di "Trend NSTEMI proportion age group `g'"
+
+    svy, subpop(age`g'): logistic adultDiseasewComorbidity c.YEAR FEMALE
+
+}
+
+
+foreach g in 1 2 3 4 5 6 {
+
+    di "Trend STEMI proportion age group `g'"
+
+    svy, subpop(age`g'): logistic adultDiseasewoComorbidity c.YEAR FEMALE
+
+}
+
+
+svy: logistic adultDiseasewComorbidity c.YEAR##i.agegrp FEMALE
+testparm i.agegrp#c.YEAR
+svy: logistic adultDiseasewoComorbidity c.YEAR##i.agegrp FEMALE
+testparm i.agegrp#c.YEAR
+
+
+
+
