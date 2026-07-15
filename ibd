@@ -1,278 +1,889 @@
+/****************************************************************************************
+AMI AGE AT HOSPITALIZATION BY AUTOIMMUNE / CHRONIC INFLAMMATORY DISEASE
+Nationwide Inpatient Sample / National Inpatient Sample (NIS)
+
+Planned data structure, coding strategy, survey setup, models, and figures
+-----------------------------------------------------------------------------------------
+1. Data structure: one observation per NIS discharge/hospitalization. NIS represents
+   hospitalizations, not unique longitudinal patients.
+2. Cohort: adult hospitalizations (AGE >=18) with acute myocardial infarction (AMI) in
+   the principal diagnosis field. Exclude missing age, missing sex, missing race in the
+   primary complete-case cohort, and any discharge with documented old/prior MI code
+   I25.2 in any diagnosis field. This exclusion reduces documented prior-MI records but
+   cannot prove the AMI is a patient's first lifetime MI because NIS has no longitudinal
+   patient identifiers.
+3. Disease coding: AMI uses principal ICD-10-CM diagnosis codes. Autoimmune/chronic
+   inflammatory diseases use all available secondary diagnosis fields and are explicitly
+   non-mutually exclusive. Code lists below are clinically defensible placeholders that
+   must be reviewed and edited before manuscript use.
+4. Survey setup: uses NIS discharge weight, stratum, hospital cluster, and year. Replace
+   the placeholder globals below if your dataset uses different variable names. For pooled
+   multi-year data, the script creates year-specific stratum/cluster identifiers.
+5. Models: survey-weighted descriptive analyses and survey-weighted linear regression
+   with AGE as the outcome. Primary disease-specific models adjust for sex, race, year,
+   Z79.5, and Z79.6; secondary models adjust for sex and race only. Premature AMI models
+   use survey-weighted logistic regression for age thresholds.
+6. Figures: weighted age-density plots, weighted age-category distributions, and a forest
+   plot of adjusted age differences.
+
+Suggested manuscript interpretation wording
+-----------------------------------------------------------------------------------------
+This descriptive cross-sectional NIS analysis evaluates age at AMI hospitalization among
+hospitalized adults with AMI. NIS contains discharge-level records and does not identify
+unique patients over time; therefore, the analysis cannot estimate population incidence or
+risk of MI and cannot confirm first-ever MI. Excluding I25.2 removes hospitalizations with
+coded evidence of old/prior MI but does not establish incident lifetime MI. Adjusted age
+coefficients are descriptive associations, not causal effects. Autoimmune disease groups
+are diagnosis-code based, may overlap, and may be affected by coding error or
+underdocumentation. Z79.5 and Z79.6 indicate documented long-term medication use only and
+capture neither dose, duration, adherence, nor all immunomodulatory therapy.
+****************************************************************************************/
+
+version 17.0
+clear matrix
+set more off
 capture log close
-log using "C:\Users\jayma\Downloads\NSTEMI.smcl", replace
 
+********************************************************************************
+* 0. USER SETTINGS: REPLACE PLACEHOLDERS IF YOUR NIS FILE USES DIFFERENT NAMES
+********************************************************************************
 
-************************************************************
-* NIS SURVEY SETUP
-************************************************************
+* Output folder. Change this path before running if needed.
+global OUTDIR "C:/Users/jayma/Downloads/ami_autoimmune_nis_outputs"
+cap mkdir "$OUTDIR"
+log using "$OUTDIR/ami_autoimmune_analysis.smcl", replace
 
-svyset [pweight = DISCWT], strata (NIS_STRATUM) psu (HOSP_NIS) singleunit(centered)
+* NIS variable placeholders. Replace only if your dataset uses different names.
+global AGEVAR      "AGE"          // age in years
+global SEXVAR      "FEMALE"       // NIS female indicator: 0=male, 1=female
+global RACEVAR     "RACE"         // NIS race/ethnicity category
+global YEARVAR     "YEAR"         // NIS calendar year
 
-************************************************************
-*RESTRICT TO ADULTS
-************************************************************
+global WT_VAR      "DISCWT"       // discharge weight
+global STRATA_VAR  "NIS_STRATUM"  // NIS stratum
+global PSU_VAR     "HOSP_NIS"     // hospital cluster identifier
+global DX_PREFIX   "I10_DX"       // diagnosis variables are I10_DX1, I10_DX2, ...
 
-keep if AGE >= 18
+* Number of diagnosis fields. If blank, the script auto-detects all variables beginning
+* with $DX_PREFIX. Set manually only if needed, for example: global MAX_DX "40".
+global MAX_DX ""
 
+* Minimum unweighted N used to flag sparse disease groups.
+local sparse_n 30
 
-************************************************************
-*IDENTIFY MI Codes (primary only)
-************************************************************
-**MI Codes**
-*STEMI: I21.0–I21.3, I22.0, I22.1, I22.8, I22.9
-*NSTEMI: I21.4, I22.2
-gen Disease = 0
-replace Disease = 1 if ///
-    substr(I10_DX1,1,4)=="I210" | ///
-    substr(I10_DX1,1,4)=="I211" | ///
-    substr(I10_DX1,1,4)=="I212" | ///
-    substr(I10_DX1,1,4)=="I213" | ///
-    substr(I10_DX1,1,4)=="I214" 
+********************************************************************************
+* 1. ICD-10-CM CODE MACROS FOR REVIEW AND EDITING
+********************************************************************************
 
-keep if Disease==1
+* AMI principal-diagnosis code families. Codes are compared after removing periods.
+local ami_stemi_prefix      "I210 I211 I212 I213 I220 I221 I228 I229"
+local ami_nstemi_prefix     "I214 I222"
+local ami_other_prefix      "I219 I21A I21B"
+local old_mi_exact          "I252"
 
-*adult Generic Disease DX1 to DX40
-generate adultDisease=0
-replace adultDisease=1 if Disease==1 & AGE>=18
-svy, subpop (adult): total adultDisease, cformat(%9.0fc)
-svy, subpop (adult): proportion adultDisease
+* Autoimmune/chronic inflammatory disease code families for secondary diagnoses.
+* These are editable, prespecified code-family macros; validate against your protocol.
+local sle_prefix            "M32"
+local ra_prefix             "M05 M06"
+local crohn_prefix          "K50"
+local uc_prefix             "K51"
+local psoriasis_prefix      "L40"
+local psoriatic_arth_prefix "L405 M070 M071 M072 M073"
+local ank_spond_prefix      "M45 M468 M469"
+local systemic_sclerosis_prefix "M34"
+local sjogren_prefix        "M350"
+local inflam_myopathy_prefix "M330 M331 M332 M339"
+local vasculitis_prefix     "M30 M31"
+local ms_prefix             "G35"
+local other_autoimmune_prefix ""   // optional placeholder; leave blank unless prespecified
 
-*COMORBIDITY= NSTEMI
-*NSTEMI: I21.4, I22.2
-gen comborbiditydx1to40 = 0
-replace comborbiditydx1to40 = 1 if ///
-    substr(I10_DX1,1,4)=="I214" 
+* Medication-use code families. Matched to documented long-term-use Z79.5/Z79.6 families.
+local steroid_prefix        "Z795"
+local immunosupp_prefix     "Z796"
 
-svy: total comborbiditydx1to40, cformat(%9.0fc)
-svy: proportion comborbiditydx1to40
+********************************************************************************
+* 2. BASIC VARIABLE AND DIAGNOSIS-FIELD CHECKS
+********************************************************************************
 
-*Adult Generic Comorbidity
-generate adultcomborbiditydx1to40=0
-replace adultcomborbiditydx1to40=1 if comborbiditydx1to40==1 
-svy: total adultcomborbiditydx1to40, cformat(%9.0fc)
-
-*TWO GROUPS: Generic Adult Disease with and without a specific comoribidty
-
-*Generic disease as DX1-40 diagnoses plus specific comborbidity
-generate adultDiseasewComorbidity=0
-replace adultDiseasewComorbidity=1 if adultDisease==1 & adultcomborbiditydx1to40==1
-svy: total adultDiseasewComorbidity
-svy, subpop (adultDisease): total adultcomborbiditydx1to40, cformat(%9.0fc)
-svy, subpop (adultDisease): proportion adultcomborbiditydx1to40
-
-*Generic Disease as DX1-40 diagnoses without specific comorbidity
-**Without Comorbidity=STEMI
-generate adultDiseasewoComorbidity=0
-replace adultDiseasewoComorbidity=1 if adultDisease==1 & adultcomborbiditydx1to40 !=1
-svy: total adultDiseasewoComorbidity
-svy, subpop (adultDisease): total adultDiseasewoComorbidity, cformat(%9.0fc)
-svy, subpop (adultDisease): proportion adultDiseasewoComorbidity
-
-**Table 1
-**Demographics
-*gender (female)
-svy, subpop (adultDisease): total FEMALE
-svy, subpop (adultDisease): proportion FEMALE
-svy, subpop (adultDiseasewComorbidity): total FEMALE, cformat(%9.1fc) 
-svy, subpop (adultDiseasewComorbidity): proportion FEMALE
-svy, subpop (adultDiseasewoComorbidity): total FEMALE, cformat(%9.0fc)
-svy, subpop (adultDiseasewoComorbidity): proportion FEMALE
-*p-Value income by regression
-svy, subpop (adultDisease): logistic adultcomborbiditydx1to40 i.FEMALE 
-*P-value by chi square
-svy, subpop (adultDisease): tabulate adultcomborbiditydx1to40 FEMALE 
-*p-value for female using  Chi Square
-*Chi-Square Distribution: When we consider, the null speculation is true, the sampling distribution of the test statistic is called as chi-squared distribution. The chi-squared test helps to determine whether there is a notable difference between the normal frequencies and the observed frequencies in one or more classes or categories. Note: Chi-squared test is applicable only for categorical data, such as men and women falling under the categories of Gender, Age, Height, etc.
-*Finding P-Value. P stands for probability here. To calculate the p-value, the chi-square test is used in statistics. The different values of p indicates the different hypothesis interpretation, are given below:
-*P≤ 0.05; Hypothesis rejected
-*P>.05; Hypothesis Accepted
-
-*Male
-generate Male=0
-replace Male=1 if FEMALE==0
-svy, subpop (adultDisease): total Male
-svy, subpop (adultDisease): proportion Male
-svy, subpop (adultDiseasewComorbidity): total Male, cformat(%9.1fc) 
-svy, subpop (adultDiseasewComorbidity): proportion Male
-svy, subpop (adultDiseasewoComorbidity): total Male, cformat(%9.0fc)
-svy, subpop (adultDiseasewoComorbidity): proportion Male
-*p-value income by regression
-svy, subpop (adultDisease): logistic adultcomborbiditydx1to40 i.Male
-*P-value by chi square
-svy, subpop (adultDisease): tabulate adultcomborbiditydx1to40 Male
-
-*gender data missing
-generate MissingGender=0
-replace MissingGender=1 if FEMALE==. & adult==1
-svy, subpop (adultDisease): total
-svy, subpop (adultDisease): proportion
-svy, subpop (adultDiseasewComorbidity): total MissingGender, cformat(%9.1fc) 
-svy, subpop (adultDiseasewComorbidity): proportion MissingGender
-svy, subpop (adultDiseasewoComorbidity): total MissingGender, cformat(%9.0fc)
-svy, subpop (adultDiseasewoComorbidity): proportion MissingGender
-*p-value income by regression
-svy, subpop (adultDisease): logistic adultcomborbiditydx1to40 i.MissingGender
-*P-value by chi square
-svy, subpop (adultDisease): tabulate adultcomborbiditydx1to40 MissingGender
-
-*AGE basic stats
-svy, subpop (adultDisease): mean AGE
-estat sd
-svy, subpop (adultDiseasewComorbidity): mean AGE
-estat sd
-svy, subpop (adultDiseasewoComorbidity): mean AGE
-estat sd
-*p-value for age by regression
-svy, subpop (adultDisease): regress AGE i.adultcomborbiditydx1to40
-svy, subpop (adultDisease): regress AGE adultcomborbiditydx1to40
-svy, subpop (adultDisease): logistic adultcomborbiditydx1to40 AGE 
-
-*Hypothesis Testing: Concept of p-value
-*In statistics, The question of interest is: Is the difference between the two groups equal to zero? The answer to this question is hypothesis testing.
-
-*Definitions:
-*Null hypothesis: H0: There is no difference between the two values we are comparing. Any numerical difference we see is due to chance alone and is therefore not true
-
-*Alternative hypothesis: H1: There is a real difference between the two values we are comparing. The numerical difference we see is not due to chance alone and is therefore true
-
-*Hypothesis testing: The process of deciding which one of the two hypothesis above is true. 
-
-*AGE descriptive statistics to get IQR (25% and 75%); median and IQR are the preferred measurement of the middle if the continuous variable is not normally distributed
-*Stata offers 4 weighting options: frequency weights (fweight), analytic weights (aweight), probability weights (pweight) and importance weights (iweight). 
-*the weight command family requires square brackets [weight] to work
-*Age of adultDisease
-summarize AGE [aweight=DISCWT] if adultDisease==1 & adult==1, detail
-*Age of Diseased group with comborbidity
-summarize AGE [aweight=DISCWT] if adultDiseasewComorbidity==1 & adult==1, detail
-*Age of Diseased group without comborbidity
-summarize AGE [aweight=DISCWT] if adultDiseasewoComorbidity==1 & adult==1, detail
-
-*Parametric= normally distributed
-*Non-parametric= nonnormally distributed (not a bell curve)
-
-*Skewness refers to a distortion or asymmetry that deviates from the symmetrical bell curve, or normal distribution, in a set of data. If the curve is shifted to the left or to the right, it is said to be skewed. The skewness value can be positive, zero, negative, or undefined. 
-*The rule of thumb seems to be: If the skewness is between -0.5 and 0.5, the data are fairly symmetrical. If the skewness is between -1 and – 0.5 or between 0.5 and 1, the data are moderately skewed. If the skewness is less than -1 or greater than 1, the data are highly skewed.
-
-*Kurtosis is a measure of whether the data are heavy-tailed or light-tailed relative to a normal distribution. That is, data sets with high kurtosis tend to have heavy tails, or outliers.
-*An excess kurtosis above 0 indicates the tails are heavier than the normal distribution. An excess kurtosis below 0 indicates the tails are lighter than the normal distribution. An excess kurtosis value of 1 and above or -1 and below represents a sizable departure from normality.
-
-*Comparing medians for age (to see if medians are statisically different)
-*Wilcoxon rank-sum test: Test for equality of distributions of v over two groups defined by the levels of catvar1
-*ranksum v, by(catvar1)"
-ranksum AGE if adultDisease==1, by(adultcomborbiditydx1to40)
-*Nonparametric equality-of-medians test
-*Equality of medians test for v over two or more groups defined by the levels of catvar2 "median v, by(catvar2)"
-median AGE if adultDisease==1, by(adultcomborbiditydx1to40)
-*"ranksum"and "median" are for use with unmatched data. For equality tests on matched data, see *Wilcoxon Wilcoxon matched-pairs signed-ranks test
-STOP
-
-************************************************
-*AGE Groups
-************************************************
-gen agegrp = .
-replace agegrp = 1 if AGE>=18 & AGE<=29
-replace agegrp = 2 if AGE>=30 & AGE<=39
-replace agegrp = 3 if AGE>=40 & AGE<=49
-replace agegrp = 4 if AGE>=50 & AGE<=59
-replace agegrp = 5 if AGE>=60 & AGE<=69
-replace agegrp = 6 if AGE>=70
-
-label define agegrp 1 "18-29" 2 "30-39" 3 "40-49" 4 "50-59" 5 "60-69" 6 "70+"
-label values agegrp agegrp
-
-gen age1 = agegrp==1
-gen age2 = agegrp==2
-gen age3 = agegrp==3
-gen age4 = agegrp==4
-gen age5 = agegrp==5
-gen age6 = agegrp==6
-
-************************************************
-* NSTEMI (adultDiseasewComorbidity) by age
-************************************************
-gen nstemi_age1 = age1==1 & adultDiseasewComorbidity==1
-gen nstemi_age2 = age2==1 & adultDiseasewComorbidity==1
-gen nstemi_age3 = age3==1 & adultDiseasewComorbidity==1
-gen nstemi_age4 = age4==1 & adultDiseasewComorbidity==1
-gen nstemi_age5 = age5==1 & adultDiseasewComorbidity==1
-gen nstemi_age6 = age6==1 & adultDiseasewComorbidity==1
-
-************************************************
-* STEMI (adultDiseasewoComorbidity) by age
-************************************************
-gen stemi_age1 = age1==1 & adultDiseasewoComorbidity==1
-gen stemi_age2 = age2==1 & adultDiseasewoComorbidity==1
-gen stemi_age3 = age3==1 & adultDiseasewoComorbidity==1
-gen stemi_age4 = age4==1 & adultDiseasewoComorbidity==1
-gen stemi_age5 = age5==1 & adultDiseasewoComorbidity==1
-gen stemi_age6 = age6==1 & adultDiseasewoComorbidity==1
-
-************************************************
-* Totals by MI Type by Age Group
-************************************************
-svy: total nstemi_age1 nstemi_age2 nstemi_age3 nstemi_age4 nstemi_age5 nstemi_age6
-svy: total stemi_age1  stemi_age2  stemi_age3  stemi_age4  stemi_age5  stemi_age6
-svy: total age1 age2 age3 age4 age5 age6
-
-************************************************
-* Trends by MI Type by Age Group
-************************************************
-svy: total nstemi_age1 nstemi_age2 nstemi_age3 nstemi_age4 nstemi_age5 nstemi_age6, over(YEAR)
-svy: total stemi_age1 stemi_age2 stemi_age3 stemi_age4 stemi_age5 stemi_age6, over(YEAR)
-svy: total age1 age2 age3 age4 age5 age6, over(YEAR)
-
-svy: proportion adultDiseasewComorbidity, over(agegrp YEAR)
-svy: proportion adultDiseasewoComorbidity, over(agegrp YEAR)
-
-*********************************************************
-*Logistic Regression for MI type trends (Unadjusted)
-*********************************************************
-foreach g in 1 2 3 4 5 6 {
-
-    di "Trend NSTEMI proportion age group `g'"
-
-    svy, subpop(age`g'): logistic adultDiseasewComorbidity c.YEAR
-
+foreach v in $AGEVAR $SEXVAR $RACEVAR $YEARVAR $WT_VAR $STRATA_VAR $PSU_VAR {
+    capture confirm variable `v'
+    if _rc {
+        di as error "Required variable `v' was not found. Update USER SETTINGS."
+        exit 111
+    }
 }
 
-
-foreach g in 1 2 3 4 5 6 {
-
-    di "Trend STEMI proportion age group `g'"
-
-    svy, subpop(age`g'): logistic adultDiseasewoComorbidity c.YEAR
-
+if "$MAX_DX" == "" {
+    ds ${DX_PREFIX}*
+    local dxvars `r(varlist)'
+}
+else {
+    local dxvars
+    forvalues j = 1/$MAX_DX {
+        capture confirm variable ${DX_PREFIX}`j'
+        if !_rc local dxvars `dxvars' ${DX_PREFIX}`j'
+    }
 }
 
-svy: logistic adultDiseasewComorbidity c.YEAR##i.agegrp
-svy: logistic adultDiseasewoComorbidity c.YEAR##i.agegrp
-
-*********************************************************
-*Logistic Regression for MI type trends (Sex adjusted)
-*********************************************************
-foreach g in 1 2 3 4 5 6 {
-
-    di "Trend NSTEMI proportion age group `g'"
-
-    svy, subpop(age`g'): logistic adultDiseasewComorbidity c.YEAR FEMALE
-
+if "`dxvars'" == "" {
+    di as error "No diagnosis variables found. Update DX_PREFIX or MAX_DX."
+    exit 111
 }
 
-
-foreach g in 1 2 3 4 5 6 {
-
-    di "Trend STEMI proportion age group `g'"
-
-    svy, subpop(age`g'): logistic adultDiseasewoComorbidity c.YEAR FEMALE
-
+capture confirm variable ${DX_PREFIX}1
+if _rc {
+    di as error "Principal diagnosis variable ${DX_PREFIX}1 not found."
+    exit 111
 }
 
+local dx_secondary : list dxvars - ${DX_PREFIX}1
+if "`dx_secondary'" == "" {
+    di as error "No secondary diagnosis fields detected. Autoimmune exposure coding requires secondary diagnoses."
+    exit 111
+}
 
-svy: logistic adultDiseasewComorbidity c.YEAR##i.agegrp FEMALE
-testparm i.agegrp#c.YEAR
-svy: logistic adultDiseasewoComorbidity c.YEAR##i.agegrp FEMALE
-testparm i.agegrp#c.YEAR
+preserve
+tempfile original analytic flow codebook desc results forest agecat
+save `original', replace
 
+********************************************************************************
+* 3. HELPER PROGRAMS
+********************************************************************************
 
+capture program drop make_prefix_indicator
+program define make_prefix_indicator
+    version 17.0
+    syntax, Generate(name) DXVars(string) Prefixes(string) [Label(string)]
+    tempvar clean
+    generate byte `generate' = 0
+    foreach dx of varlist `dxvars' {
+        quietly replace `generate' = 1 if `generate' == 0 & `dx' != "" & inlist(1, 0)
+        foreach p of local prefixes {
+            quietly replace `generate' = 1 if `generate' == 0 & ///
+                substr(upper(subinstr(`dx', ".", "", .)), 1, length("`p'")) == "`p'"
+        }
+    }
+    if "`label'" != "" label variable `generate' "`label'"
+end
 
+capture program drop check_binary
+program define check_binary
+    version 17.0
+    syntax varlist
+    foreach v of varlist `varlist' {
+        capture assert inlist(`v', 0, 1) if !missing(`v')
+        if _rc {
+            di as error "Binary check failed for `v'."
+            exit 459
+        }
+    }
+end
 
+capture program drop post_flow
+program define post_flow
+    version 17.0
+    syntax, Step(string) Handle(name)
+    quietly count
+    local n = r(N)
+    quietly total one [pweight = ${WT_VAR}]
+    matrix b = e(b)
+    local w = b[1,1]
+    post `handle' ("`step'") (`n') (`w')
+end
+
+capture program drop get_weighted_total
+program define get_weighted_total, rclass
+    version 17.0
+    syntax [if/]
+    quietly total one [pweight = ${WT_VAR}] `if'
+    matrix b = e(b)
+    return scalar weighted_n = b[1,1]
+end
+
+********************************************************************************
+* 4. ICD-10-CM CODE DICTIONARY EXPORT
+********************************************************************************
+
+tempname cpost
+postfile `cpost' str40 disease_group str300 code_family str20 diagnosis_fields using `codebook', replace
+post `cpost' ("AMI STEMI") ("`ami_stemi_prefix'") ("Principal only")
+post `cpost' ("AMI NSTEMI") ("`ami_nstemi_prefix'") ("Principal only")
+post `cpost' ("AMI other/unspecified") ("`ami_other_prefix'") ("Principal only")
+post `cpost' ("Old/prior MI exclusion") ("`old_mi_exact'") ("Any diagnosis")
+post `cpost' ("Systemic lupus erythematosus") ("`sle_prefix'") ("Secondary diagnoses")
+post `cpost' ("Rheumatoid arthritis") ("`ra_prefix'") ("Secondary diagnoses")
+post `cpost' ("Crohn disease") ("`crohn_prefix'") ("Secondary diagnoses")
+post `cpost' ("Ulcerative colitis") ("`uc_prefix'") ("Secondary diagnoses")
+post `cpost' ("Psoriasis") ("`psoriasis_prefix'") ("Secondary diagnoses")
+post `cpost' ("Psoriatic arthritis") ("`psoriatic_arth_prefix'") ("Secondary diagnoses")
+post `cpost' ("Ankylosing/axial spondyloarthritis") ("`ank_spond_prefix'") ("Secondary diagnoses")
+post `cpost' ("Systemic sclerosis") ("`systemic_sclerosis_prefix'") ("Secondary diagnoses")
+post `cpost' ("Sjogren syndrome") ("`sjogren_prefix'") ("Secondary diagnoses")
+post `cpost' ("Inflammatory myopathy") ("`inflam_myopathy_prefix'") ("Secondary diagnoses")
+post `cpost' ("Systemic vasculitis") ("`vasculitis_prefix'") ("Secondary diagnoses")
+post `cpost' ("Multiple sclerosis") ("`ms_prefix'") ("Secondary diagnoses")
+post `cpost' ("Other autoimmune disease") ("`other_autoimmune_prefix'") ("Secondary diagnoses; optional placeholder")
+post `cpost' ("Long-term systemic steroid use") ("`steroid_prefix'") ("Any diagnosis")
+post `cpost' ("Long-term immunosuppressive drug use") ("`immunosupp_prefix'") ("Any diagnosis")
+postclose `cpost'
+
+use `codebook', clear
+export delimited using "$OUTDIR/icd10_code_dictionary.csv", replace
+use `original', clear
+
+********************************************************************************
+* 5. SURVEY DESIGN SETUP AND COHORT FLOW
+********************************************************************************
+
+generate double one = 1
+label variable one "Constant for weighted totals"
+
+* Create year-specific design identifiers for pooled years. This avoids accidental reuse
+* of hospital or stratum identifiers across NIS years.
+egen long nis_stratum_year = group(${YEARVAR} ${STRATA_VAR}), missing
+egen long hosp_nis_year = group(${YEARVAR} ${PSU_VAR}), missing
+label variable nis_stratum_year "Year-specific NIS stratum"
+label variable hosp_nis_year "Year-specific hospital cluster"
+
+svyset hosp_nis_year [pweight = ${WT_VAR}], strata(nis_stratum_year) singleunit(centered)
+
+tempname fpost
+postfile `fpost' str80 flow_step double unweighted_n weighted_n using `flow', replace
+post_flow, step("Original NIS hospitalizations") handle(`fpost')
+
+********************************************************************************
+* 6. AMI, OLD MI, AND EXCLUSION INDICATORS
+********************************************************************************
+
+* Clean principal diagnosis and create AMI subtype indicators.
+generate str12 dx1_clean = upper(subinstr(${DX_PREFIX}1, ".", "", .))
+label variable dx1_clean "Principal diagnosis without periods, uppercase"
+
+generate byte ami_stemi = 0
+generate byte ami_nstemi = 0
+generate byte ami_other_unspecified = 0
+foreach p of local ami_stemi_prefix {
+    replace ami_stemi = 1 if substr(dx1_clean, 1, length("`p'")) == "`p'"
+}
+foreach p of local ami_nstemi_prefix {
+    replace ami_nstemi = 1 if substr(dx1_clean, 1, length("`p'")) == "`p'"
+}
+foreach p of local ami_other_prefix {
+    replace ami_other_unspecified = 1 if substr(dx1_clean, 1, length("`p'")) == "`p'"
+}
+
+generate byte principal_ami = ami_stemi == 1 | ami_nstemi == 1 | ami_other_unspecified == 1
+label variable ami_stemi "Principal-diagnosis STEMI"
+label variable ami_nstemi "Principal-diagnosis NSTEMI"
+label variable ami_other_unspecified "Principal-diagnosis other/unspecified AMI"
+label variable principal_ami "Principal-diagnosis acute MI"
+
+* Create old/prior MI indicator before exclusions, using all diagnosis fields.
+generate byte old_mi_i252 = 0
+foreach dx of varlist `dxvars' {
+    replace old_mi_i252 = 1 if upper(subinstr(`dx', ".", "", .)) == "`old_mi_exact'"
+}
+label variable old_mi_i252 "Any diagnosis I25.2 old/prior MI"
+
+check_binary ami_stemi ami_nstemi ami_other_unspecified principal_ami old_mi_i252
+
+* Report exclusions and then apply them. Counts are sequential.
+count if missing(${AGEVAR})
+local excl_unw = r(N)
+get_weighted_total if missing(${AGEVAR})
+local excl_w = r(weighted_n)
+di as text "Excluded for missing age: unweighted=`excl_unw' weighted=`excl_w'"
+drop if missing(${AGEVAR})
+post_flow, step("After excluding missing age") handle(`fpost')
+
+count if ${AGEVAR} < 18
+local excl_unw = r(N)
+get_weighted_total if ${AGEVAR} < 18
+local excl_w = r(weighted_n)
+di as text "Excluded for age <18: unweighted=`excl_unw' weighted=`excl_w'"
+drop if ${AGEVAR} < 18
+post_flow, step("After restricting to adults age >=18") handle(`fpost')
+
+count if missing(${SEXVAR})
+local excl_unw = r(N)
+get_weighted_total if missing(${SEXVAR})
+local excl_w = r(weighted_n)
+di as text "Excluded for missing sex: unweighted=`excl_unw' weighted=`excl_w'"
+drop if missing(${SEXVAR})
+post_flow, step("After excluding missing sex") handle(`fpost')
+
+count if principal_ami != 1
+local excl_unw = r(N)
+get_weighted_total if principal_ami != 1
+local excl_w = r(weighted_n)
+di as text "Excluded for not meeting principal-diagnosis AMI definition: unweighted=`excl_unw' weighted=`excl_w'"
+drop if principal_ami != 1
+post_flow, step("After keeping adult principal-diagnosis AMI") handle(`fpost')
+
+count if old_mi_i252 == 1
+local excl_unw = r(N)
+get_weighted_total if old_mi_i252 == 1
+local excl_w = r(weighted_n)
+di as text "Excluded for I25.2 old/prior MI in any diagnosis field: unweighted=`excl_unw' weighted=`excl_w'"
+drop if old_mi_i252 == 1
+post_flow, step("After excluding any I25.2 old/prior MI code") handle(`fpost')
+
+count if missing(${RACEVAR})
+local excl_unw = r(N)
+get_weighted_total if missing(${RACEVAR})
+local excl_w = r(weighted_n)
+di as text "Excluded for missing race in primary complete-case cohort: unweighted=`excl_unw' weighted=`excl_w'"
+drop if missing(${RACEVAR})
+post_flow, step("Final primary complete-case AMI cohort") handle(`fpost')
+postclose `fpost'
+
+* Final cohort verification: no I25.2 remains and all records are eligible adult AMI.
+assert ${AGEVAR} >= 18 & ${AGEVAR} < .
+assert principal_ami == 1
+assert !missing(${SEXVAR})
+assert !missing(${RACEVAR})
+assert old_mi_i252 == 0
+foreach dx of varlist `dxvars' {
+    assert upper(subinstr(`dx', ".", "", .)) != "`old_mi_exact'"
+}
+
+save `analytic', replace
+use `flow', clear
+export delimited using "$OUTDIR/cohort_flow_summary.csv", replace
+putexcel set "$OUTDIR/cohort_flow_summary.xlsx", replace
+putexcel A1 = "Flow step" B1 = "Unweighted N" C1 = "Weighted N"
+local row = 2
+quietly count
+forvalues i = 1/`r(N)' {
+    putexcel A`row' = flow_step[`i'] B`row' = unweighted_n[`i'] C`row' = weighted_n[`i']
+    local ++row
+}
+use `analytic', clear
+
+********************************************************************************
+* 7. AUTOIMMUNE AND MEDICATION INDICATORS (NON-MUTUALLY EXCLUSIVE)
+********************************************************************************
+
+make_prefix_indicator, generate(sle) dxvars("`dx_secondary'") prefixes("`sle_prefix'") label("Systemic lupus erythematosus")
+make_prefix_indicator, generate(ra) dxvars("`dx_secondary'") prefixes("`ra_prefix'") label("Rheumatoid arthritis")
+make_prefix_indicator, generate(crohn) dxvars("`dx_secondary'") prefixes("`crohn_prefix'") label("Crohn disease")
+make_prefix_indicator, generate(uc) dxvars("`dx_secondary'") prefixes("`uc_prefix'") label("Ulcerative colitis")
+make_prefix_indicator, generate(psoriasis) dxvars("`dx_secondary'") prefixes("`psoriasis_prefix'") label("Psoriasis")
+make_prefix_indicator, generate(psoriatic_arthritis) dxvars("`dx_secondary'") prefixes("`psoriatic_arth_prefix'") label("Psoriatic arthritis")
+make_prefix_indicator, generate(ank_spond) dxvars("`dx_secondary'") prefixes("`ank_spond_prefix'") label("Ankylosing spondylitis / axial spondyloarthritis")
+make_prefix_indicator, generate(systemic_sclerosis) dxvars("`dx_secondary'") prefixes("`systemic_sclerosis_prefix'") label("Systemic sclerosis")
+make_prefix_indicator, generate(sjogren) dxvars("`dx_secondary'") prefixes("`sjogren_prefix'") label("Sjogren syndrome")
+make_prefix_indicator, generate(inflam_myopathy) dxvars("`dx_secondary'") prefixes("`inflam_myopathy_prefix'") label("Inflammatory myopathy")
+make_prefix_indicator, generate(vasculitis) dxvars("`dx_secondary'") prefixes("`vasculitis_prefix'") label("Systemic vasculitis")
+make_prefix_indicator, generate(ms) dxvars("`dx_secondary'") prefixes("`ms_prefix'") label("Multiple sclerosis")
+
+if "`other_autoimmune_prefix'" != "" {
+    make_prefix_indicator, generate(other_autoimmune) dxvars("`dx_secondary'") prefixes("`other_autoimmune_prefix'") label("Other prespecified autoimmune disease")
+}
+else {
+    generate byte other_autoimmune = 0
+    label variable other_autoimmune "Other autoimmune disease placeholder; no codes specified"
+}
+
+generate byte ibd = crohn == 1 | uc == 1
+label variable ibd "Inflammatory bowel disease: Crohn disease or ulcerative colitis"
+
+* Medication-use indicators use any diagnosis field and are documented long-term-use codes.
+make_prefix_indicator, generate(longterm_steroid) dxvars("`dxvars'") prefixes("`steroid_prefix'") label("Documented long-term systemic steroid use: Z79.5 family")
+make_prefix_indicator, generate(longterm_immunosuppressant) dxvars("`dxvars'") prefixes("`immunosupp_prefix'") label("Documented long-term immunosuppressive drug use: Z79.6 family")
+generate byte any_immunosuppressive_use = longterm_steroid == 1 | longterm_immunosuppressant == 1
+label variable any_immunosuppressive_use "Documented long-term steroid or immunosuppressive use"
+
+local disease_vars sle ra crohn uc ibd psoriasis psoriatic_arthritis ank_spond systemic_sclerosis sjogren inflam_myopathy vasculitis ms other_autoimmune
+local disease_labels "Systemic lupus erythematosus" "Rheumatoid arthritis" "Crohn disease" "Ulcerative colitis" "Inflammatory bowel disease" "Psoriasis" "Psoriatic arthritis" "Ankylosing/axial spondyloarthritis" "Systemic sclerosis" "Sjogren syndrome" "Inflammatory myopathy" "Systemic vasculitis" "Multiple sclerosis" "Other autoimmune disease"
+local disease_model_vars sle ra crohn uc psoriasis psoriatic_arthritis ank_spond systemic_sclerosis sjogren inflam_myopathy vasculitis ms other_autoimmune
+local disease_model_ibd_vars sle ra ibd psoriasis psoriatic_arthritis ank_spond systemic_sclerosis sjogren inflam_myopathy vasculitis ms other_autoimmune
+
+check_binary `disease_vars' longterm_steroid longterm_immunosuppressant any_immunosuppressive_use
+
+egen autoimmune_count = rowtotal(`disease_model_vars')
+label variable autoimmune_count "Number of selected non-IBD-combined autoimmune disease indicators"
+
+generate byte any_autoimmune = autoimmune_count >= 1
+generate byte multiple_autoimmune = autoimmune_count >= 2
+generate byte autoimmune_burden = .
+replace autoimmune_burden = 0 if autoimmune_count == 0
+replace autoimmune_burden = 1 if autoimmune_count == 1
+replace autoimmune_burden = 2 if autoimmune_count >= 2
+label define autoimmune_burden 0 "0 selected autoimmune diseases" 1 "1 selected autoimmune disease" 2 ">=2 selected autoimmune diseases", replace
+label values autoimmune_burden autoimmune_burden
+label variable any_autoimmune "Any selected autoimmune disease"
+label variable multiple_autoimmune "Two or more selected autoimmune diseases"
+label variable autoimmune_burden "Selected autoimmune disease burden"
+
+* Consistency checks: overlapping groups are allowed; no hierarchy is imposed.
+egen autoimmune_count_check = rowtotal(`disease_model_vars')
+assert autoimmune_count == autoimmune_count_check
+assert any_autoimmune == (autoimmune_count >= 1)
+assert multiple_autoimmune == (autoimmune_count >= 2)
+drop autoimmune_count_check
+
+* Exact/family medication checks: Z79.5 and Z79.6 indicators should only arise from those families.
+foreach med in longterm_steroid longterm_immunosuppressant {
+    assert inlist(`med', 0, 1)
+}
+
+********************************************************************************
+* 8. ANALYTIC COVARIATES AND PREMATURE AMI OUTCOMES
+********************************************************************************
+
+* Preserve original NIS race categories while creating labeled analytic categories.
+generate race_cat = ${RACEVAR}
+label variable race_cat "Analytic race/ethnicity category; original NIS categories preserved"
+label define race_cat 1 "White" 2 "Black" 3 "Hispanic" 4 "Asian or Pacific Islander" 5 "Native American" 6 "Other", replace
+label values race_cat race_cat
+
+* Sex reference category is male if FEMALE=0; race reference is lowest coded nonmissing category.
+generate byte female = ${SEXVAR}
+label variable female "Female sex; reference is male"
+label define female 0 "Male" 1 "Female", replace
+label values female female
+
+foreach t in 40 50 55 65 {
+    generate byte age_lt`t' = ${AGEVAR} < `t'
+    label variable age_lt`t' "AMI hospitalization age <`t' years"
+}
+
+generate byte no_autoimmune = any_autoimmune == 0
+label variable no_autoimmune "No selected autoimmune disease"
+
+generate byte psor_or_psa = psoriasis == 1 | psoriatic_arthritis == 1
+label variable psor_or_psa "Psoriasis or psoriatic arthritis"
+
+check_binary female no_autoimmune psor_or_psa age_lt40 age_lt50 age_lt55 age_lt65
+
+save `analytic', replace
+
+********************************************************************************
+* 9. DESCRIPTIVE TABLES
+********************************************************************************
+
+* Disease-specific columns are non-mutually exclusive and should not be summed.
+tempname dpost
+postfile `dpost' str45 group_name str30 group_var double unweighted_n weighted_n mean_age mean_lci mean_uci sd_age median_age p25_age p75_age pct_female pct_steroid pct_immunosupp pct_any_immunosupp pct_stemi pct_nstemi pct_lt40 pct_lt50 pct_lt55 pct_lt65 using `desc', replace
+
+local table_groups no_autoimmune any_autoimmune `disease_vars'
+foreach g of local table_groups {
+    local glabel : variable label `g'
+    if "`glabel'" == "" local glabel "`g'"
+
+    quietly count if `g' == 1
+    local unw = r(N)
+    get_weighted_total if `g' == 1
+    local ww = r(weighted_n)
+
+    quietly svy, subpop(`g'): mean ${AGEVAR}
+    matrix M = r(table)
+    local mage = M[1,1]
+    local mlci = M[5,1]
+    local muci = M[6,1]
+    estat sd
+    matrix S = r(sd)
+    local sdage = S[1,1]
+
+    quietly summarize ${AGEVAR} [aweight = ${WT_VAR}] if `g' == 1, detail
+    local med = r(p50)
+    local p25 = r(p25)
+    local p75 = r(p75)
+
+    foreach x in female longterm_steroid longterm_immunosuppressant any_immunosuppressive_use ami_stemi ami_nstemi age_lt40 age_lt50 age_lt55 age_lt65 {
+        quietly mean `x' [pweight = ${WT_VAR}] if `g' == 1
+        local p_`x' = _b[`x'] * 100
+    }
+
+    post `dpost' ("`glabel'") ("`g'") (`unw') (`ww') (`mage') (`mlci') (`muci') (`sdage') (`med') (`p25') (`p75') (`p_female') (`p_longterm_steroid') (`p_longterm_immunosuppressant') (`p_any_immunosuppressive_use') (`p_ami_stemi') (`p_ami_nstemi') (`p_age_lt40') (`p_age_lt50') (`p_age_lt55') (`p_age_lt65')
+
+    svy, subpop(`g'): proportion female race_cat longterm_steroid longterm_immunosuppressant any_immunosuppressive_use ami_stemi ami_nstemi age_lt40 age_lt50 age_lt55 age_lt65
+}
+postclose `dpost'
+
+use `desc', clear
+export delimited using "$OUTDIR/descriptive_baseline_table.csv", replace
+export excel using "$OUTDIR/descriptive_baseline_table.xlsx", firstrow(variables) replace
+use `analytic', clear
+
+********************************************************************************
+* 10. PRIMARY DISEASE-SPECIFIC LINEAR REGRESSION AND MARGINS
+********************************************************************************
+
+tempname rpost
+postfile `rpost' str45 disease_name str30 disease_var double unweighted_n weighted_n crude_mean_age adj_mean_present adj_present_lci adj_present_uci adj_mean_absent adj_absent_lci adj_absent_uci beta lci uci raw_p q_value using `results', replace
+
+local i = 0
+foreach d of local disease_vars {
+    local ++i
+    local dname : variable label `d'
+    if "`dname'" == "" local dname "`d'"
+
+    quietly count if `d' == 1
+    local dn = r(N)
+    get_weighted_total if `d' == 1
+    local dwn = r(weighted_n)
+    quietly mean ${AGEVAR} [pweight = ${WT_VAR}] if `d' == 1
+    local crude = _b[${AGEVAR}]
+
+    * Model 1: demographic adjusted.
+    svy: regress ${AGEVAR} i.`d' i.female i.race_cat
+    estimates store m1_`d'
+
+    * Model 2: primary minimally adjusted; age is the outcome and is not adjusted for.
+    svy: regress ${AGEVAR} i.`d' i.female i.race_cat i.${YEARVAR} longterm_steroid longterm_immunosuppressant
+    estimates store m2_`d'
+
+    matrix T = r(table)
+    local col = colnumb(T, "1.`d'")
+    if missing(`col') {
+        local b = .
+        local ll = .
+        local uu = .
+        local p = .
+    }
+    else {
+        local b = T[1, `col']
+        local ll = T[5, `col']
+        local uu = T[6, `col']
+        local p = T[4, `col']
+    }
+
+    margins `d'
+    matrix MT = r(table)
+    local mean0 = MT[1,1]
+    local lci0 = MT[5,1]
+    local uci0 = MT[6,1]
+    local mean1 = MT[1,2]
+    local lci1 = MT[5,2]
+    local uci1 = MT[6,2]
+    margins, dydx(`d')
+
+    post `rpost' ("`dname'") ("`d'") (`dn') (`dwn') (`crude') (`mean1') (`lci1') (`uci1') (`mean0') (`lci0') (`uci0') (`b') (`ll') (`uu') (`p') (.)
+
+    * Sparse-cell flag for interpretation.
+    if `dn' < `sparse_n' di as error "Sparse disease group: `dname' has unweighted N=`dn'. Interpret estimates cautiously."
+}
+postclose `rpost'
+
+* Benjamini-Hochberg FDR q-values for primary disease-specific estimates.
+use `results', clear
+generate long sort_original = _n
+sort raw_p
+generate rank_p = _n if raw_p < .
+quietly count if raw_p < .
+local m = r(N)
+generate bh_value = raw_p * `m' / rank_p if raw_p < .
+generate q_tmp = .
+forvalues j = `m'(-1)1 {
+    if `j' == `m' replace q_tmp = min(bh_value, 1) in `j'
+    else replace q_tmp = min(bh_value, q_tmp[_n+1], 1) in `j'
+}
+replace q_value = q_tmp
+sort sort_original
+drop sort_original rank_p bh_value q_tmp
+save `results', replace
+export delimited using "$OUTDIR/primary_linear_regression_results.csv", replace
+export excel using "$OUTDIR/primary_linear_regression_results.xlsx", firstrow(variables) replace
+use `analytic', clear
+
+********************************************************************************
+* 11. SIMULTANEOUS DISEASE MODELS, OVERLAP, AND DIAGNOSTICS
+********************************************************************************
+
+* Version A: combined IBD, not separate Crohn/UC.
+svy: regress ${AGEVAR} `disease_model_ibd_vars' i.female i.race_cat i.${YEARVAR} longterm_steroid longterm_immunosuppressant
+estimates store simultaneous_combined_ibd
+
+* Version B: separate Crohn and UC, not combined IBD.
+svy: regress ${AGEVAR} `disease_model_vars' i.female i.race_cat i.${YEARVAR} longterm_steroid longterm_immunosuppressant
+estimates store simultaneous_crohn_uc
+
+* Non-survey VIF is provided as a rough multicollinearity diagnostic only.
+regress ${AGEVAR} `disease_model_vars' i.female i.race_cat i.${YEARVAR} longterm_steroid longterm_immunosuppressant [pweight = ${WT_VAR}]
+estat vif
+
+* Disease overlap frequencies and autoimmune burden distribution.
+tab autoimmune_count
+svy: proportion autoimmune_burden
+tab2 `disease_model_vars', firstonly
+preserve
+contract `disease_model_vars', freq(unweighted_n)
+generate selected_count = 0
+foreach d of local disease_model_vars {
+    replace selected_count = selected_count + `d'
+}
+sort -unweighted_n
+export delimited using "$OUTDIR/disease_overlap_combinations.csv", replace
+restore
+
+********************************************************************************
+* 12. AUTOIMMUNE BURDEN ANALYSIS
+********************************************************************************
+
+svy: regress ${AGEVAR} i.autoimmune_burden i.female i.race_cat i.${YEARVAR} longterm_steroid longterm_immunosuppressant
+estimates store burden_categorical
+margins autoimmune_burden
+margins, dydx(autoimmune_burden)
+
+svy: regress ${AGEVAR} c.autoimmune_count i.female i.race_cat i.${YEARVAR} longterm_steroid longterm_immunosuppressant
+estimates store burden_count_continuous
+
+********************************************************************************
+* 13. PREMATURE AMI LOGISTIC REGRESSION MODELS
+********************************************************************************
+
+tempfile premature
+tempname ppost
+postfile `ppost' str30 threshold str45 disease_name str30 disease_var str20 model double or lci uci p using `premature', replace
+
+foreach thr in 40 50 55 65 {
+    foreach d of local disease_vars {
+        local dname : variable label `d'
+        if "`dname'" == "" local dname "`d'"
+
+        quietly count if `d' == 1 & age_lt`thr' == 1
+        local cell1 = r(N)
+        quietly count if `d' == 1 & age_lt`thr' == 0
+        local cell0 = r(N)
+        if `cell1' == 0 | `cell0' == 0 di as error "Potential separation/sparse cells: `dname', age <`thr'."
+
+        svy: logistic age_lt`thr' i.`d' i.female i.race_cat
+        estimates store logit_demo_`d'_lt`thr'
+        matrix T = r(table)
+        local col = colnumb(T, "1.`d'")
+        if !missing(`col') post `ppost' ("Age <`thr'") ("`dname'") ("`d'") ("Sex/race") (T[1,`col']) (T[5,`col']) (T[6,`col']) (T[4,`col'])
+
+        svy: logistic age_lt`thr' i.`d' i.female i.race_cat i.${YEARVAR} longterm_steroid longterm_immunosuppressant
+        estimates store logit_primary_`d'_lt`thr'
+        matrix T = r(table)
+        local col = colnumb(T, "1.`d'")
+        if !missing(`col') post `ppost' ("Age <`thr'") ("`dname'") ("`d'") ("Primary") (T[1,`col']) (T[5,`col']) (T[6,`col']) (T[4,`col'])
+    }
+}
+postclose `ppost'
+
+use `premature', clear
+export delimited using "$OUTDIR/premature_ami_logistic_results.csv", replace
+use `analytic', clear
+
+********************************************************************************
+* 14. AGE-DISTRIBUTION FIGURES
+********************************************************************************
+
+* Figure 1: weighted kernel density. Stata kdensity allows analytic weights; this is a
+* weighted descriptive density, not a full survey-estimated density with design-based SEs.
+twoway ///
+    (kdensity ${AGEVAR} [aweight=${WT_VAR}] if no_autoimmune == 1 & inrange(${AGEVAR},18,90), lcolor(black) lwidth(medthick)) ///
+    (kdensity ${AGEVAR} [aweight=${WT_VAR}] if sle == 1 & inrange(${AGEVAR},18,90), lcolor(red)) ///
+    (kdensity ${AGEVAR} [aweight=${WT_VAR}] if ra == 1 & inrange(${AGEVAR},18,90), lcolor(blue)) ///
+    (kdensity ${AGEVAR} [aweight=${WT_VAR}] if ibd == 1 & inrange(${AGEVAR},18,90), lcolor(green)) ///
+    (kdensity ${AGEVAR} [aweight=${WT_VAR}] if psor_or_psa == 1 & inrange(${AGEVAR},18,90), lcolor(orange)) ///
+    (kdensity ${AGEVAR} [aweight=${WT_VAR}] if systemic_sclerosis == 1 & inrange(${AGEVAR},18,90), lcolor(purple)), ///
+    legend(order(1 "No autoimmune" 2 "SLE" 3 "RA" 4 "IBD" 5 "Psoriasis/PsA" 6 "Systemic sclerosis") rows(2)) ///
+    xtitle("Age at AMI hospitalization, years") ytitle("Weighted density") ///
+    title("Weighted age distribution among adult AMI hospitalizations") ///
+    note("Groups may overlap; display restricted to ages 18-90 without deleting analytic records.")
+graph export "$OUTDIR/figure1_weighted_age_density.png", width(3000) replace
+graph export "$OUTDIR/figure1_weighted_age_density.tif", width(3000) replace
+graph export "$OUTDIR/figure1_weighted_age_density.pdf", replace
+
+* Figure 2: weighted age-category distribution.
+generate byte agecat_fig = .
+replace agecat_fig = 1 if inrange(${AGEVAR}, 18, 39)
+replace agecat_fig = 2 if inrange(${AGEVAR}, 40, 49)
+replace agecat_fig = 3 if inrange(${AGEVAR}, 50, 59)
+replace agecat_fig = 4 if inrange(${AGEVAR}, 60, 69)
+replace agecat_fig = 5 if inrange(${AGEVAR}, 70, 79)
+replace agecat_fig = 6 if ${AGEVAR} >= 80 & ${AGEVAR} < .
+label define agecat_fig 1 "18-39" 2 "40-49" 3 "50-59" 4 "60-69" 5 "70-79" 6 ">=80", replace
+label values agecat_fig agecat_fig
+
+preserve
+tempname apost
+postfile `apost' str40 group_name byte agecat double pct using `agecat', replace
+foreach g in no_autoimmune sle ra ibd psor_or_psa systemic_sclerosis {
+    local glabel : variable label `g'
+    if "`glabel'" == "" local glabel "`g'"
+    forvalues c = 1/6 {
+        quietly total one [pweight=${WT_VAR}] if `g' == 1 & agecat_fig == `c'
+        matrix num = e(b)
+        quietly total one [pweight=${WT_VAR}] if `g' == 1
+        matrix den = e(b)
+        local pct = 100 * num[1,1] / den[1,1]
+        post `apost' ("`glabel'") (`c') (`pct')
+    }
+}
+postclose `apost'
+use `agecat', clear
+label values agecat agecat_fig
+export delimited using "$OUTDIR/figure2_age_category_percentages.csv", replace
+graph bar pct, over(agecat) over(group_name, label(angle(35))) asyvars percentages ///
+    ytitle("Weighted percentage") title("Weighted age-group distribution") ///
+    note("Columns are non-mutually exclusive disease groups and should not be summed.")
+graph export "$OUTDIR/figure2_weighted_age_groups.png", width(3000) replace
+graph export "$OUTDIR/figure2_weighted_age_groups.tif", width(3000) replace
+graph export "$OUTDIR/figure2_weighted_age_groups.pdf", replace
+restore
+
+* Figure 3: forest plot of adjusted age differences from primary models.
+use `results', clear
+keep if beta < .
+sort beta
+generate plot_order = _n
+generate label_text = disease_name + " (n=" + string(unweighted_n, "%9.0fc") + ")"
+levelsof plot_order, local(forest_levels)
+label define forest_order 0 "", replace
+foreach k of local forest_levels {
+    quietly levelsof label_text if plot_order == `k', local(lbl) clean
+    label define forest_order `k' "`lbl'", add
+}
+label values plot_order forest_order
+save `forest', replace
+twoway (rcap lci uci plot_order, horizontal) (scatter plot_order beta, mcolor(navy)), ///
+    yscale(reverse) ylabel(1(1)`=_N', valuelabel angle(0) labsize(vsmall)) ///
+    xline(0, lpattern(dash) lcolor(gs8)) xtitle("Adjusted mean age difference, years") ///
+    ytitle("") title("Adjusted age difference at AMI hospitalization") ///
+    note("Negative values indicate younger age than AMI hospitalizations without the disease.")
+graph export "$OUTDIR/figure3_adjusted_age_difference_forest.png", width(3000) replace
+graph export "$OUTDIR/figure3_adjusted_age_difference_forest.tif", width(3000) replace
+graph export "$OUTDIR/figure3_adjusted_age_difference_forest.pdf", replace
+use `analytic', clear
+
+********************************************************************************
+* 15. SEX-STRATIFIED ANALYSES AND INTERACTIONS
+********************************************************************************
+
+foreach sexval in 0 1 {
+    foreach d of local disease_vars {
+        svy, subpop(if female == `sexval'): regress ${AGEVAR} i.`d' i.race_cat i.${YEARVAR} longterm_steroid longterm_immunosuppressant
+        estimates store sex`sexval'_primary_`d'
+    }
+}
+
+foreach d of local disease_vars {
+    svy: regress ${AGEVAR} i.`d'##i.female i.race_cat i.${YEARVAR} longterm_steroid longterm_immunosuppressant
+    estimates store interaction_`d'
+    margins `d'#female
+    marginsplot, title("Adjusted mean age by `d' and sex") ytitle("Adjusted mean age")
+    graph export "$OUTDIR/marginsplot_`d'_by_sex.png", width(2400) replace
+}
+
+********************************************************************************
+* 16. SENSITIVITY ANALYSES
+********************************************************************************
+
+* 1. Exclude hospitalizations with more than one selected autoimmune disease.
+preserve
+keep if autoimmune_count <= 1
+foreach d of local disease_vars {
+    svy: regress ${AGEVAR} i.`d' i.female i.race_cat i.${YEARVAR} longterm_steroid longterm_immunosuppressant
+    estimates store sens_single_disease_`d'
+}
+restore
+
+* 2. Repeat disease-specific analyses without Z79.5/Z79.6 adjustment.
+foreach d of local disease_vars {
+    svy: regress ${AGEVAR} i.`d' i.female i.race_cat i.${YEARVAR}
+    estimates store sens_no_med_adjust_`d'
+}
+
+* 3. Combined IBD and separate Crohn/UC versions are stored above as simultaneous models.
+
+* 4. Primary cohort already requires principal-diagnosis AMI; verify this.
+assert principal_ami == 1
+
+* 5. Optional broader cohort allowing AMI in any diagnosis position. This is a sensitivity
+* template only; it restores the original dataset and applies the same adult/sex/race/I25.2
+* exclusions after identifying AMI in any diagnosis field.
+preserve
+use `original', clear
+generate double one = 1
+generate byte anydx_ami = 0
+foreach dx of varlist `dxvars' {
+    generate str12 clean_`dx' = upper(subinstr(`dx', ".", "", .))
+    foreach p of local ami_stemi_prefix {
+        replace anydx_ami = 1 if substr(clean_`dx', 1, length("`p'")) == "`p'"
+    }
+    foreach p of local ami_nstemi_prefix {
+        replace anydx_ami = 1 if substr(clean_`dx', 1, length("`p'")) == "`p'"
+    }
+    foreach p of local ami_other_prefix {
+        replace anydx_ami = 1 if substr(clean_`dx', 1, length("`p'")) == "`p'"
+    }
+    drop clean_`dx'
+}
+keep if ${AGEVAR} >= 18 & !missing(${AGEVAR}) & !missing(${SEXVAR}) & !missing(${RACEVAR}) & anydx_ami == 1
+restore
+
+* 6. Stratify by STEMI and NSTEMI.
+foreach subtype in ami_stemi ami_nstemi {
+    foreach d of local disease_vars {
+        svy, subpop(`subtype'): regress ${AGEVAR} i.`d' i.female i.race_cat i.${YEARVAR} longterm_steroid longterm_immunosuppressant
+        estimates store sens_`subtype'_`d'
+    }
+}
+
+* 7. Exclude very rare groups from simultaneous model based on unweighted N.
+local not_rare
+foreach d of local disease_model_vars {
+    quietly count if `d' == 1
+    if r(N) >= `sparse_n' local not_rare `not_rare' `d'
+    else di as error "Excluded from not-rare simultaneous model for sparse N: `d' N=" r(N)
+}
+svy: regress ${AGEVAR} `not_rare' i.female i.race_cat i.${YEARVAR} longterm_steroid longterm_immunosuppressant
+estimates store simultaneous_not_rare
+
+* 8. Missing-race category sensitivity analysis.
+preserve
+use `original', clear
+* Re-run from the primary script up to cohort creation for a production analysis. The
+* following placeholder demonstrates race-category construction with missing as category 99.
+generate race_cat_missing = ${RACEVAR}
+replace race_cat_missing = 99 if missing(race_cat_missing)
+label define race_cat_missing 99 "Missing race/ethnicity", add
+restore
+
+* 9. Before vs after 2020.
+generate byte post2020 = ${YEARVAR} >= 2020 if ${YEARVAR} < .
+label variable post2020 "NIS year 2020 or later"
+foreach d of local disease_vars {
+    svy: regress ${AGEVAR} i.`d'##i.post2020 i.female i.race_cat longterm_steroid longterm_immunosuppressant
+    estimates store sens_post2020_`d'
+}
+
+********************************************************************************
+* 17. MODEL DIAGNOSTICS
+********************************************************************************
+
+* Age distribution and residual checks for representative primary model.
+histogram ${AGEVAR} [aweight=${WT_VAR}], width(5) percent title("Weighted age distribution in AMI cohort")
+graph export "$OUTDIR/diagnostic_weighted_age_histogram.png", width(2400) replace
+
+svy: regress ${AGEVAR} i.any_autoimmune i.female i.race_cat i.${YEARVAR} longterm_steroid longterm_immunosuppressant
+estimates store diagnostic_any_autoimmune
+predict double resid_any_autoimmune, residuals
+histogram resid_any_autoimmune, title("Residual distribution: any autoimmune model")
+graph export "$OUTDIR/diagnostic_residual_histogram.png", width(2400) replace
+
+* Sparse cells for logistic regression thresholds.
+foreach d of local disease_vars {
+    foreach thr in 40 50 55 65 {
+        tab `d' age_lt`thr'
+    }
+}
+
+********************************************************************************
+* 18. SAVE FINAL ANALYTIC DATASET AND ESTIMATES
+********************************************************************************
+
+save "$OUTDIR/analytic_ami_autoimmune_dataset.dta", replace
+estimates dir
+
+* Some Stata installations may not have estout/esttab; estimates are stored in memory
+* and key results are exported above as CSV/XLSX. Add estimates save if desired.
+estimates save "$OUTDIR/stored_estimates", replace
+
+log close
+restore
